@@ -6,7 +6,7 @@
 
 ;;CONSTANTS HERE;;
 
--- Temporary point types for control flow structures in the decompiler
+-- Temporary point types for handling control flow structures
 local POINT_TYPE_END = 0
 local POINT_TYPE_ELSE = 1
 local POINT_TYPE_ELSEIF = 2
@@ -47,13 +47,10 @@ local Reader = LoadFromUrl("Reader")
 local Strings = LoadFromUrl("Strings")
 local Luau = LoadFromUrl("Luau")
 
--- Extract various constants and functions from the Luau module
+-- Extract constants and functions from Luau
 local LuauOpCode = Luau.OpCode
 local LuauBytecodeTag = Luau.BytecodeTag
-local LuauBytecodeType = Luau.BytecodeType
 local LuauCaptureType = Luau.CaptureType
-local LuauBuiltinFunction = Luau.BuiltinFunction
-local LuauProtoFlag = Luau.ProtoFlag
 
 local toboolean = Implementations.toboolean
 local toEscapedString = Implementations.toEscapedString
@@ -68,7 +65,7 @@ local function Decompile(bytecode)
     local bytecodeVersion, typeEncodingVersion
     local reader = Reader.new(bytecode)
 
-    -- Function to disassemble bytecode
+    -- Function to disassemble the bytecode
     local function disassemble()
         if bytecodeVersion >= 4 then
             typeEncodingVersion = reader:nextByte()
@@ -113,12 +110,10 @@ local function Decompile(bytecode)
                 proto.numUpvalues = reader:nextByte()
                 proto.isVarArg = toboolean(reader:nextByte())
 
-                -- Prepare for upvalue references
                 if proto.numUpvalues > 0 then
                     proto.nestedUpvalues = table.create(proto.numUpvalues)
                 end
 
-                -- Read flags if bytecode version supports it
                 if bytecodeVersion >= 4 then
                     proto.flags = reader:nextByte()
                     proto.typeinfo = reader:nextBytes(reader:nextVarInt())
@@ -130,7 +125,6 @@ local function Decompile(bytecode)
                     proto.insnTable[i] = encodedInsn
                 end
 
-                -- Read the constants
                 proto.sizeConsts = reader:nextVarInt()
                 for i = 1, proto.sizeConsts do
                     local constType = reader:nextByte()
@@ -184,7 +178,7 @@ local function Decompile(bytecode)
 
                 local hasLineInfo = toboolean(reader:nextByte())
                 if hasLineInfo then
-                    -- Additional line info handling...
+                    -- Parse additional line info if available
                 end
             end
         end
@@ -194,33 +188,29 @@ local function Decompile(bytecode)
         return protoTable[mainProtoId], protoTable, stringTable
     end
 
-    -- Main assembly and decompilation function
+    -- Primary decompilation logic
     local function roughDecompilation()
         local output = ""
         local mainProto, protoTable, stringTable = disassemble()
 
         local inlineRemarks = {}
         local function handleInlinedCalls()
-            -- Function to process inlined calls
+            -- Process calls to inlined functions
         end
-
         handleInlinedCalls()
 
-        -- Prepare global data and other necessary local variables
         local globalData = {}
         local totalParams = 0
         local totalVars = 0
 
         local function baseProto(proto, depth, isMainProto)
-            local localData = {}  -- Local variable container
-            local refData = {}     -- Reference data container
+            local localData = {}
+            local refData = {}
 
-            -- Initialize control flow structures
             local ifLoopPoints = {}
             local promotedJumps = {}
 
             local function createLoopPoint(jumpId, pointId)
-                -- Handles jump points in control flows
                 if promotedJumps[jumpId] then return end
 
                 local pointData = ifLoopPoints[pointId] or table.create(1)
@@ -258,49 +248,33 @@ local function Decompile(bytecode)
                 ifLoopPoints[pointId] = pointData
             end
 
-            -- Begin processing for the given proto
             local protoId = proto.id
             local protoNumParams = proto.numParams
             local protoFlags = proto.flags
-
             local protoVars = 0
 
             local function logRegister(t, register)
-                local dataTable
-                if t == "local" then
-                    dataTable = localData
-                    protoVars += 1
-                elseif t == "global" then
-                    dataTable = globalData
-                end
+                local dataTable = t == "local" and localData or globalData
                 local isLogged = table.find(dataTable, register) ~= nil
                 if not isLogged then
                     table.insert(dataTable, register)
                 end
-                return isLogged
             end
 
             local function modifyRegister(register, isUpvalue)
-                if register < protoNumParams then
-                    return `p{(totalParams - protoNumParams) + register + 1}`
-                else
-                    local starterCount = isUpvalue and 0 or totalVars
-                    return `v{starterCount + depth + register - protoNumParams}`, true
-                end
+                return register < protoNumParams
+                        and `p{(totalParams - protoNumParams) + register + 1}`
+                        or `v{totalVars + depth + register - protoNumParams}`, true
             end
 
-            -- Output functions for local and global variables
+            -- Function outputs for handling locals and globals
             local function baseLocal(register, value)
                 local prefix = "local "
                 if logRegister("local", register) then
                     prefix = ""
                 end
 
-                local register, isVar = modifyRegister(register)
-                if not isVar then
-                    prefix = ""
-                end
-
+                register, _ = modifyRegister(register)
                 return `{prefix}{register} = {value}`
             end
 
@@ -313,23 +287,16 @@ local function Decompile(bytecode)
                 local output = "function"
                 if proto.source then
                     output = "local " .. output .. ` {proto.source}`
-                else
-                    output = output .. "()"
                 end
+                output = output .. "("
 
-                -- Prepare for parameters
                 for i = 1, proto.numParams do
                     output ..= modifyRegister(i)
                     if i < proto.numParams then
                         output ..= ", "
                     end
                 end
-
-                -- Handle variable argument parameters
                 if proto.isVarArg then
-                    if proto.numParams > 0 then
-                        output ..= ", "
-                    end
                     output ..= "..."
                 end
 
@@ -337,20 +304,18 @@ local function Decompile(bytecode)
                 return output
             end
 
-            -- The main proto output collection
             local protoOutput = ""
             local function addTab(depth)
                 protoOutput ..= string.rep("    ", depth)
             end
 
             if isMainProto then
-                protoOutput ..= "/* Function Output */\n"
+                protoOutput ..= baseFunc()
             else
                 protoOutput ..= baseFunc()
                 depth += 1
             end
 
-            -- Instruction processing loop, handling various operation codes
             for insnIndex, insn in pairs(proto.insnTable) do
                 addTab(depth)
 
@@ -366,7 +331,6 @@ local function Decompile(bytecode)
                     continue
                 end
 
-                -- Fetch the correct operation constructor
                 local ctor = opConstructors[opInfo.name]
                 if ctor then
                     ctor()
@@ -383,17 +347,14 @@ local function Decompile(bytecode)
                 protoOutput ..= "end\n"
             end
 
-            proto.numVars = protoVars
             return protoOutput
         end
 
         -- Generate the decompiled output
-        local decompiledOutput = baseProto(mainProto, 0, true)
-        output ..= decompiledOutput
-        return output
+        return baseProto(mainProto, 0, true)
     end
 
-    -- Check bytecode version and determine if it is supported
+    -- Check bytecode version
     bytecodeVersion = reader:nextByte()
     if bytecodeVersion == 0 then
         return "Compilation failed"
