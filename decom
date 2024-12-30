@@ -1,0 +1,438 @@
+--!optimize 2
+
+-- TODO: Add --optimize hotcomment support if possible
+-- TODO: Stop listing nested upvalues and use them directly
+-- TODO: Use letter "u" instead of "v" for upvalues
+
+;;CONSTANTS HERE;;
+
+-- Temporary point types for control flow structures in the decompiler
+local POINT_TYPE_END = 0
+local POINT_TYPE_ELSE = 1
+local POINT_TYPE_ELSEIF = 2
+
+-- Function to load modules from a URL using HttpGet
+local function LoadFromUrl(moduleName)
+    local BASE_USER = "w-a-e"
+    local BASE_BRANCH = "main"
+    local BASE_URL = "https://raw.githubusercontent.com/%s/Advanced-Decompiler-V3/%s/%s.lua"
+
+    local loadSuccess, loadResult = pcall(function()
+        local formattedUrl = string.format(BASE_URL, BASE_USER, BASE_BRANCH, moduleName)
+        return game:HttpGet(formattedUrl, true)
+    end)
+
+    if not loadSuccess then
+        warn(`Failed to load module from URL: {loadResult}.`)
+        return
+    end
+
+    local success, result = pcall(loadstring, loadResult)
+    if not success then
+        warn(`Failed to load string: {result}.`)
+        return
+    end
+
+    if type(result) ~= "function" then
+        warn(`Expected function, received: {tostring(result)}`)
+        return
+    end
+
+    return result()
+end
+
+-- Load necessary modules for the decompiler
+local Implementations = LoadFromUrl("Implementations")
+local Reader = LoadFromUrl("Reader")
+local Strings = LoadFromUrl("Strings")
+local Luau = LoadFromUrl("Luau")
+
+-- Extract various constants and functions from the Luau module
+local LuauOpCode = Luau.OpCode
+local LuauBytecodeTag = Luau.BytecodeTag
+local LuauBytecodeType = Luau.BytecodeType
+local LuauCaptureType = Luau.CaptureType
+local LuauBuiltinFunction = Luau.BuiltinFunction
+local LuauProtoFlag = Luau.ProtoFlag
+
+local toboolean = Implementations.toboolean
+local toEscapedString = Implementations.toEscapedString
+local formatIndexString = Implementations.formatIndexString
+local isGlobal = Implementations.isGlobal
+
+-- Set the float precision for the reader
+Reader:Set(READER_FLOAT_PRECISION)
+
+-- Main decompilation function for bytecode
+local function Decompile(bytecode)
+    local bytecodeVersion, typeEncodingVersion
+    local reader = Reader.new(bytecode)
+
+    -- Function to disassemble bytecode
+    local function disassemble()
+        if bytecodeVersion >= 4 then
+            typeEncodingVersion = reader:nextByte()
+        end
+
+        local stringTable = {}
+        local function readStringTable()
+            local sizeStringTable = reader:nextVarInt()
+            for i = 1, sizeStringTable do
+                stringTable[i] = reader:nextString()
+            end
+        end
+        readStringTable()
+
+        local userdataTypes = {}
+        while true do
+            local index = reader:nextByte()
+            if index == 0 then break end
+
+            local nameRef = reader:nextVarInt()
+            userdataTypes[index] = nameRef
+        end
+
+        local protoTable = {}
+        local function readProtoTable()
+            local sizeProtoTable = reader:nextVarInt()
+            for i = 1, sizeProtoTable do
+                local protoId = i - 1
+                local proto = {
+                    id = protoId,
+                    insnTable = {},
+                    constsTable = {},
+                    innerProtoTable = {},
+                    smallLineInfo = {},
+                    largeLineInfo = {},
+                    firstInstruction = nil
+                }
+                protoTable[protoId] = proto
+
+                proto.maxStackSize = reader:nextByte()
+                proto.numParams = reader:nextByte()
+                proto.numUpvalues = reader:nextByte()
+                proto.isVarArg = toboolean(reader:nextByte())
+
+                -- Prepare for upvalue references
+                if proto.numUpvalues > 0 then
+                    proto.nestedUpvalues = table.create(proto.numUpvalues)
+                end
+
+                -- Read flags if bytecode version supports it
+                if bytecodeVersion >= 4 then
+                    proto.flags = reader:nextByte()
+                    proto.typeinfo = reader:nextBytes(reader:nextVarInt())
+                end
+
+                proto.sizeInsns = reader:nextVarInt()
+                for i = 1, proto.sizeInsns do
+                    local encodedInsn = reader:nextUInt32()
+                    proto.insnTable[i] = encodedInsn
+                end
+
+                -- Read the constants
+                proto.sizeConsts = reader:nextVarInt()
+                for i = 1, proto.sizeConsts do
+                    local constType = reader:nextByte()
+                    local constValue
+
+                    if constType == LuauBytecodeTag.LBC_CONSTANT_BOOLEAN then
+                        constValue = toboolean(reader:nextByte())
+                    elseif constType == LuauBytecodeTag.LBC_CONSTANT_NUMBER then
+                        constValue = reader:nextDouble()
+                    elseif constType == LuauBytecodeTag.LBC_CONSTANT_STRING then
+                        local stringId = reader:nextVarInt()
+                        constValue = stringTable[stringId]
+                    elseif constType == LuauBytecodeTag.LBC_CONSTANT_IMPORT then
+                        local id = reader:nextUInt32()
+                        local importTag = "("
+
+                        for index = 0, 2 do -- Retrieve up to 3 imports
+                            local cacheIndex = (bit32.rshift(id, index * 10)) & 0x3FF
+                            if (id >> 30) > index then
+                                importTag ..= tostring(proto.constsTable[cacheIndex + 1].value) .. ", "
+                            end
+                        end
+
+                        importTag = importTag:sub(1, -3) .. ")"
+                        constValue = "import - " .. importTag
+                    elseif constType == LuauBytecodeTag.LBC_CONSTANT_TABLE then
+                        constValue = { ["size"] = reader:nextVarInt(), ["keys"] = {} }
+                        for _ = 1, constValue.size do
+                            local keyStringId = reader:nextVarInt() + 1
+                            table.insert(constValue.keys, keyStringId)
+                        end
+                    elseif constType == LuauBytecodeTag.LBC_CONSTANT_CLOSURE then
+                        constValue = reader:nextVarInt() + 1
+                    elseif constType == LuauBytecodeTag.LBC_CONSTANT_VECTOR then
+                        local x, y, z, w = reader:nextFloat(), reader:nextFloat(), reader:nextFloat(), reader:nextFloat()
+                        constValue = w ~= 0 and `Vector3.new({x}, {y}, {z}, {w})` or `Vector3.new({x}, {y}, {z})`
+                    end
+
+                    proto.constsTable[i] = { ["type"] = constType, ["value"] = constValue }
+                end
+
+                proto.sizeInnerProtos = reader:nextVarInt()
+                for i = 1, proto.sizeInnerProtos do
+                    local protoId = reader:nextVarInt()
+                    proto.innerProtoTable[i] = protoTable[protoId]
+                end
+
+                proto.lineDefined = reader:nextVarInt()
+                local protoSourceId = reader:nextVarInt()
+                proto.source = stringTable[protoSourceId]
+
+                local hasLineInfo = toboolean(reader:nextByte())
+                if hasLineInfo then
+                    -- Additional line info handling...
+                end
+            end
+        end
+        readProtoTable()
+
+        local mainProtoId = reader:nextVarInt()
+        return protoTable[mainProtoId], protoTable, stringTable
+    end
+
+    -- Main assembly and decompilation function
+    local function roughDecompilation()
+        local output = ""
+        local mainProto, protoTable, stringTable = disassemble()
+
+        local inlineRemarks = {}
+        local function handleInlinedCalls()
+            -- Function to process inlined calls
+        end
+
+        handleInlinedCalls()
+
+        -- Prepare global data and other necessary local variables
+        local globalData = {}
+        local totalParams = 0
+        local totalVars = 0
+
+        local function baseProto(proto, depth, isMainProto)
+            local localData = {}  -- Local variable container
+            local refData = {}     -- Reference data container
+
+            -- Initialize control flow structures
+            local ifLoopPoints = {}
+            local promotedJumps = {}
+
+            local function createLoopPoint(jumpId, pointId)
+                -- Handles jump points in control flows
+                if promotedJumps[jumpId] then return end
+
+                local pointData = ifLoopPoints[pointId] or table.create(1)
+                local pointInsn = proto.insnTable[pointId]
+                local pointOP = pointInsn and Luau:INSN_OP(pointInsn)
+                local pointInfo = LuauOpCode[pointOP]
+                if pointInfo and pointInfo.name == "JUMP" then
+                    local promote = false
+                    local jumpEndPoint = pointId + Luau:INSN_sD(pointInsn)
+                    for i = pointId + 1, jumpEndPoint do
+                        local insn = proto.insnTable[i]
+                        local op = Luau:INSN_OP(insn)
+                        local opInfo = LuauOpCode[op]
+                        if opInfo and string.find(opInfo.name, "JUMP") then
+                            local endPoint = i + Luau:INSN_sD(insn)
+                            if endPoint == jumpEndPoint then
+                                promotedJumps[i] = true
+                                promote = true
+                                break
+                            else
+                                break
+                            end
+                        end
+                    end
+
+                    if promote then
+                        table.insert(pointData, POINT_TYPE_ELSEIF)
+                    else
+                        table.insert(pointData, POINT_TYPE_ELSE)
+                    end
+                else
+                    table.insert(pointData, POINT_TYPE_END)
+                end
+
+                ifLoopPoints[pointId] = pointData
+            end
+
+            -- Begin processing for the given proto
+            local protoId = proto.id
+            local protoNumParams = proto.numParams
+            local protoFlags = proto.flags
+
+            local protoVars = 0
+
+            local function logRegister(t, register)
+                local dataTable
+                if t == "local" then
+                    dataTable = localData
+                    protoVars += 1
+                elseif t == "global" then
+                    dataTable = globalData
+                end
+                local isLogged = table.find(dataTable, register) ~= nil
+                if not isLogged then
+                    table.insert(dataTable, register)
+                end
+                return isLogged
+            end
+
+            local function modifyRegister(register, isUpvalue)
+                if register < protoNumParams then
+                    return `p{(totalParams - protoNumParams) + register + 1}`
+                else
+                    local starterCount = isUpvalue and 0 or totalVars
+                    return `v{starterCount + depth + register - protoNumParams}`, true
+                end
+            end
+
+            -- Output functions for local and global variables
+            local function baseLocal(register, value)
+                local prefix = "local "
+                if logRegister("local", register) then
+                    prefix = ""
+                end
+
+                local register, isVar = modifyRegister(register)
+                if not isVar then
+                    prefix = ""
+                end
+
+                return `{prefix}{register} = {value}`
+            end
+
+            local function baseGlobal(key, value)
+                logRegister("global", key)
+                return `{key} = {value}`
+            end
+
+            local function baseFunc()
+                local output = "function"
+                if proto.source then
+                    output = "local " .. output .. ` {proto.source}`
+                else
+                    output = output .. "()"
+                end
+
+                -- Prepare for parameters
+                for i = 1, proto.numParams do
+                    output ..= modifyRegister(i)
+                    if i < proto.numParams then
+                        output ..= ", "
+                    end
+                end
+
+                -- Handle variable argument parameters
+                if proto.isVarArg then
+                    if proto.numParams > 0 then
+                        output ..= ", "
+                    end
+                    output ..= "..."
+                end
+
+                output ..= ") {"
+                return output
+            end
+
+            -- The main proto output collection
+            local protoOutput = ""
+            local function addTab(depth)
+                protoOutput ..= string.rep("    ", depth)
+            end
+
+            if isMainProto then
+                protoOutput ..= "/* Function Output */\n"
+            else
+                protoOutput ..= baseFunc()
+                depth += 1
+            end
+
+            -- Instruction processing loop, handling various operation codes
+            for insnIndex, insn in pairs(proto.insnTable) do
+                addTab(depth)
+
+                local OP = Luau:INSN_OP(insn)
+                local A = Luau:INSN_A(insn)
+                local B = Luau:INSN_B(insn)
+                local C = Luau:INSN_C(insn)
+                local D = Luau:INSN_D(insn)
+
+                local opInfo = LuauOpCode[OP]
+                if not opInfo then
+                    protoOutput ..= `UNKNOWN OP: {OP}`
+                    continue
+                end
+
+                -- Fetch the correct operation constructor
+                local ctor = opConstructors[opInfo.name]
+                if ctor then
+                    ctor()
+                else
+                    warn(`OP '{opInfo.name}' went unhandled: missing constructor`)
+                end
+
+                addNewLine()
+            end
+
+            if not isMainProto then
+                depth -= 1
+                addTab(depth)
+                protoOutput ..= "end\n"
+            end
+
+            proto.numVars = protoVars
+            return protoOutput
+        end
+
+        -- Generate the decompiled output
+        local decompiledOutput = baseProto(mainProto, 0, true)
+        output ..= decompiledOutput
+        return output
+    end
+
+    -- Check bytecode version and determine if it is supported
+    bytecodeVersion = reader:nextByte()
+    if bytecodeVersion == 0 then
+        return "Compilation failed"
+    elseif bytecodeVersion >= LuauBytecodeTag.LBC_VERSION_MIN and 
+           bytecodeVersion <= LuauBytecodeTag.LBC_VERSION_MAX then
+        return roughDecompilation()
+    else
+        return "Unsupported bytecode version"
+    end
+end
+
+-- Define the decompile function in the global environment
+local _ENV = (getgenv or getrenv or getfenv)()
+_ENV.decompile = function(script)
+    if typeof(script) ~= "Instance" then
+        error("invalid argument #1 to 'decompile' (Instance expected)", 2)
+        return
+    end
+
+    local function isScriptValid()
+        local class = script.ClassName
+        return class == "LocalScript" or class == "ModuleScript"
+    end
+
+    if not isScriptValid() then
+        error("invalid argument #1 to 'decompile' (Instance<LocalScript, ModuleScript> expected)", 2)
+        return
+    end
+
+    if not getscriptbytecode then
+        error("decompile is not enabled. (getscriptbytecode is missing)", 2)
+        return
+    end
+
+    local success, result = pcall(getscriptbytecode, script)
+    if not success or type(result) ~= "string" then
+        error(`decompile failed to grab script bytecode: {tostring(result)}`, 2)
+        return
+    end
+
+    return Decompile(result)
+end
