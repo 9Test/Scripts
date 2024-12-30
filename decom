@@ -15,7 +15,7 @@ local POINT_TYPE_ELSEIF = 2
 local function LoadFromUrl(moduleName)
     local BASE_USER = "w-a-e"
     local BASE_BRANCH = "main"
-    local BASE_URL = "https://raw.githubusercontent.com/%s/Advanced-Decompiler-V3/%s/%s.lua"
+    local BASE_URL = "https://raw.githubusercontent.com/9Test/Scripts/refs/heads/main/decom"
 
     local loadSuccess, loadResult = pcall(function()
         local formattedUrl = string.format(BASE_URL, BASE_USER, BASE_BRANCH, moduleName)
